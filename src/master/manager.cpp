@@ -144,10 +144,8 @@ struct Vtep
     // NOTE: The below shift operation results in `32 - network.prefix()
     // remaining bits in the LSB of `endIP`.
     uint32_t endIP = 0xffffffff >> network.prefix(); 
-    uint32_t endMAC = 0xffffffff >> 8;
 
     freeIP += (Bound<uint32_t>::closed(1), Bound<uint32_t>::closed(endIP - 1));
-    freeMAC += (Bound<uint32_t>::closed(1), Bound<uint32_t>::closed(endMAC - 1));
   }
 
   Try<IPNetwork> allocateIP()
@@ -184,43 +182,21 @@ struct Vtep
     return Nothing();
   }
 
-  Try<Nothing> free(const IPNetwork& _network)
+  // We generate the VTEP MAC from the IP by taking the least 24 bits
+  // of the IP and using the 24 bits as the NIC of the MAC.
+  // 
+  // NOTE: There is a caveat to using this technique to generating the
+  // MAC, namely if the CIDR prefix of the IP is less than 8 then we
+  // the MAC being generated is not guaranteed to be unique.
+  Try<MAC> generateMAC(const net::IP& ip)
   {
-    if (_network.prefix() != network.prefix()) {
-      return Error(
-          "Cannot free this network because prefix " +
-          stringify(_network.prefix()) + " does not match Agent prefix "
-          + stringify(network.prefix()) + " of the overlay");
+    Try<struct in_addr> in = ip.in();
+
+    if (in.isError()) {
+      return Error(in.error());
     }
 
-    if (_network.prefix() < network.prefix()) {
-      return Error(
-          "Cannot free this network since it does not belong "
-          " to the overlay subnet");
-    }
-
-    uint32_t address = ntohl(_network.address().in().get().s_addr);
-    uint32_t mask = ntohl(_network.netmask().in().get().s_addr);
-
-    address &= ~mask;
-
-    freeIP += address;
-
-    return Nothing();
-  }
-
-  Try<MAC> allocateMAC()
-  {
-    if (freeMAC.empty()) {
-      return Error("Unable to allocate VTEP MAC due to exhaustion");
-    }
-
-    uint32_t _nic = freeMAC.begin()->lower();
-    freeMAC -= _nic;
-
-    _nic = htonl(_nic);
-
-    uint8_t* nic = (uint8_t*)&_nic;
+    uint8_t *nic = (uint8_t*)&(in.get().s_addr);
 
     uint8_t mac[6];
 
@@ -228,7 +204,7 @@ struct Vtep
     mac[0] = oui[0];
     mac[1] = oui[1];
     mac[2] = oui[2];
-
+    
     //Set the NIC.
     mac[3] = nic[1];
     mac[4] = nic[2];
@@ -237,68 +213,12 @@ struct Vtep
     return MAC(mac);
   }
 
-  Try<Nothing> reserve(net::MAC mac)
-  {
-    uint32_t _mac = 0;
-    uint8_t* __mac = (uint8_t*) &_mac;
-
-    __mac[1] = mac[3];
-    __mac[2] = mac[4];
-    __mac[3] = mac[5];
-
-    _mac = ntohl(_mac);
-
-    if (!freeMAC.contains(_mac)) {
-      return Error(
-          "Cannot reserve an unavailable MAC " +
-          stringify(mac) + "(" + stringify(_mac) + ")");
-    }
-
-    freeMAC -= _mac;
-
-    return Nothing();
-  }
-
-  Try<Nothing> free(const MAC& mac)
-  {
-    if (mac[0] != oui[0] || mac[1] != oui[1] || mac[2] != oui[2]) {
-      return Error("Unable to free MAC for an unknown OUI");
-    }
-
-    uint32_t _nic ;
-
-    uint8_t* nic = (uint8_t*) &_nic;
-    nic[1] = mac[3];
-    nic[2] = mac[4];
-    nic[3] = mac[5];
-
-    _nic = ntohl(_nic);
-
-    freeMAC += _nic;
-
-    return Nothing();
-  }
-
-  void resetIP()
+  void reset()
   {
     uint32_t endIP = 0xffffffff >> network.prefix();
 
     freeIP = IntervalSet<uint32_t>();
     freeIP += (Bound<uint32_t>::closed(1), Bound<uint32_t>::closed(endIP - 1));
-  }
-
-  void resetMAC()
-  {
-    uint32_t endMAC = 0xffffffff >> 8;
-
-    freeMAC = IntervalSet<uint32_t>();
-    freeMAC += (Bound<uint32_t>::closed(1), Bound<uint32_t>::closed(endMAC - 1));
-  }
-
-  void reset()
-  {
-    resetIP();
-    resetMAC();
   }
 
   // Network allocated to the VTEP.
@@ -307,7 +227,6 @@ struct Vtep
   MAC oui;
 
   IntervalSet<uint32_t> freeIP;
-  IntervalSet<uint32_t> freeMAC;
 };
 
 
@@ -447,6 +366,11 @@ public:
       agent.addOverlay(agentInfo.overlays(i));
     }
 
+    // We should clear any overlay `State` that might have been set.
+    // The `State` will be set once this information is downloaded to
+    // the corresponding agent.
+    agent.clearOverlaysState();
+
     return agent;
   }
 
@@ -564,6 +488,14 @@ public:
     if (vtepSubnet.isError()) {
       return Error(
           "Unable to parse the VTEP Subnet: " + vtepSubnet.error());
+    }
+
+    // Make sure the VTEP subnet CIDR is not less than /8
+    if (vtepSubnet.get().prefix() < 8) {
+      return Error(
+          "VTEP MAC are derived from last 24 bits of VTEP IP.  Hence, "
+          "in order to guarantee unique VTEP MAC we need the VTEP IP "
+          "subnet to greater than /8");
     }
 
     Try<net::MAC> vtepMACOUI = createMAC(networkConfig.vtep_mac_oui(), true);
@@ -795,6 +727,8 @@ protected:
     for (int i = 0; i < networkState.agents_size(); i++) {
       const AgentInfo& agentInfo = networkState.agents(i);
 
+      // Cleare the `State` of the `AgentInfo`
+
       Try<Agent> agent = Agent::create(agentInfo);
       if (agent.isError()) {
         LOG(ERROR) << "Could not recover Agent: "<< agent.error();
@@ -806,6 +740,9 @@ protected:
 
       for (int j = 0; j < agentInfo.overlays_size(); j++) {
         const AgentOverlayInfo& overlay = agentInfo.overlays(j);
+
+        // clear the overlay state.
+        networkState.mutable_agents(i)->mutable_overlays(j)->clear_state();
 
         Try<net::IPNetwork> network = net::IPNetwork::parse(
             overlay.subnet(),
@@ -841,29 +778,15 @@ protected:
             abort();
           }
 
-          Try<net::MAC> vtepMAC = createMAC(
-              overlay.backend().vxlan().vtep_mac(),
-              false);
-          if (vtepMAC.isError()) {
-            LOG(ERROR) << "Unable to parse the retrieved `vtepMAC`: "
-              << overlay.backend().vxlan().vtep_mac() << ": "
-              << vtepMAC.error();
-            abort();
-          }
-
+          // NOTE: We only need to reserve the VTEP IP and not the
+          // VTEP MAC since the VTEP MAC is derived from the VTEP IP.
+          // Look at the `generateMAC` method in `VTEP` to see how
+          // this is done.
           LOG(INFO) << "Reserving VTEP IP: " << vtepIP.get();
           Try<Nothing> result = vtep.reserve(vtepIP.get());
           if (result.isError()) {
             LOG(ERROR) << "Unable to reserve VTEP IP: "
               << vtepIP.get() << ": " << result.error();
-            abort();
-          }
-
-          LOG(INFO) << "Reserving VTEP MAC: " << vtepMAC.get();
-          result = vtep.reserve(vtepMAC.get());
-          if (result.isError()) {
-            LOG(ERROR) << "Unable to reserve VTEP MAC: "
-              << vtepMAC.get() << ": " << result.error();
             abort();
           }
         }
@@ -900,6 +823,16 @@ protected:
       // restart, does not expect the overlays to have any state.
       agent.clearOverlaysState();
 
+      // We need to update the Agents state in `networkState`
+      const string agentIP = stringify(pid.address.ip);
+      for (int i = 0; i < networkState.agents_size(); i++) {
+        if (agentIP == networkState.agents(i).ip()) {
+          networkState.mutable_agents(i)->CopyFrom(
+              agents.at(pid.address.ip).getAgentInfo());
+          break;
+        }
+      }
+
       _overlays = agent.getOverlays();
     } else {
       // New Agent.
@@ -917,7 +850,7 @@ protected:
       }
       LOG(INFO) << "Allocated VTEP IP : " << vtepIP.get();
 
-      Try<net::MAC> vtepMAC = vtep.allocateMAC();
+      Try<net::MAC> vtepMAC = vtep.generateMAC(vtepIP.get().address());
       if (vtepMAC.isError()) {
         LOG(ERROR)
           << "Unable to get VTEP MAC for Agent: " << vtepMAC.error()
@@ -1028,16 +961,16 @@ protected:
     agents.clear();
     networkState.clear_agents();
 
-    //While we should not clear all the overlays (since they are static) we
-    //need to de-allocate the address space of the overlays so that
-    //when this master becomes the leader it can reserve any
-    //addresses that were pending.
+    // While we should not clear all the overlays (since they are static) we
+    // need to de-allocate the address space of the overlays so that
+    // when this master becomes the leader it can reserve any
+    // addresses that were pending.
     foreachvalue(Overlay& overlay, overlays) {
       overlay.reset();
     }
 
-    //We need to de-allocate the VTEP MAC and VTEP addresses
-    //allocated to the Agent as well.
+    // We need to de-allocate the VTEP MAC and VTEP addresses
+    // allocated to the Agent as well.
     vtep.reset();
   }
 
@@ -1045,8 +978,18 @@ protected:
   {
     if(agents.contains(from.address.ip)) {
       LOG(INFO) << "Got ACK for addition of networks from " << from;
-      for(int i=0; i < message.overlays_size(); i++) {
+      for(int i = 0; i < message.overlays_size(); i++) {
         agents.at(from.address.ip).updateOverlayState(message.overlays(i));
+      }
+
+      // Update the Agent State.
+      const string agent = stringify(from.address.ip);
+      for (int i = 0; i < networkState.agents_size(); i++) {
+        if (agent == networkState.agents(i).ip()) {
+          networkState.mutable_agents(i)->CopyFrom(
+              agents.at(from.address.ip).getAgentInfo());
+          break;
+        }
       }
 
       send(from, AgentRegisteredAcknowledgement());
