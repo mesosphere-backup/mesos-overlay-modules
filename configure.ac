@@ -1,4 +1,4 @@
-AC_INIT([net-modules],[0.1])
+AC_INIT([mesos-overlay-modules],[0.1])
 AC_PREREQ([2.69])
 AC_CONFIG_FILES([Makefile])
 AC_LANG([C++])
@@ -35,7 +35,7 @@ AC_ARG_WITH([protobuf],
             [protobuf=/usr])
 
 AC_ARG_WITH([zookeeper],
-            [AS_HELP_STRING([--with-mesos-zookeeper@<:@=DIR@:>@],
+            [AS_HELP_STRING([--with-zookeeper@<:@=DIR@:>@],
                             [Zookeeper installation path that is
                             different from the bundled installation
                             available with Mesos.])],
@@ -56,7 +56,7 @@ if test -d "$mesos"; then
   fi
   #Set up the zookeeper headers.
   if test -n "`echo $with_zookeeper`"; then
-    MESOS_INCLUDE_PATH="${MESOS_INCLUDE_PATH} -I${with_zookeeper}/include/zookeeper"
+    MESOS_INCLUDE_PATH="${MESOS_INCLUDE_PATH} -I${with_zookeeper}/include -I${with_zookeeper}/generated -I${with_zookeeper}/include/zookeeper -I${with_zookeeper}"
   else
     #Use the zookeeper bundled with Mesos.
     MESOS_INCLUDE_PATH="${MESOS_INCLUDE_PATH} -I${mesos}/lib/mesos/3rdparty/include/zookeeper"
